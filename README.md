@@ -303,7 +303,7 @@ rather than "its type outlives `'static`" or "the value is `'static`" to refer t
 
 ### `Send` bound
 
-Tasks spawned by `tokio::spawn`**must*** implement `Send`. This allows the Tokio
+Tasks spawned by `tokio::spawn` **must** implement `Send`. This allows the Tokio
 runtime to move the tasks between threads while they are suspended at an `.await`.
 
 Tasks are `Send` when **all** data that is held **across** `.await` calls is `Send`.
@@ -355,7 +355,7 @@ async fn main() {
 }
 ```
 
-Attempting to copmile the snippet results in:
+Attempting to compile the snippet results in:
 
 ```
 error: future cannot be sent between threads safely
