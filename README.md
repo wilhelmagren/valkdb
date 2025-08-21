@@ -301,3 +301,234 @@ rather than "its type outlives `'static`" or "the value is `'static`" to refer t
 `'static`" as in `&'static T`.
 
 
+### `Send` bound
+
+Tasks spawned by `tokio::spawn`**must*** implement `Send`. This allows the Tokio
+runtime to move the tasks between threads while they are suspended at an `.await`.
+
+Tasks are `Send` when **all** data that is held **across** `.await` calls is `Send`.
+This is a bit subtle. When `.await` is called, the task yields back to the scheduler.
+The next time the task is executed, it resumes from the point it last yielded. To make
+this work, all state that is used **after** `.await` must be saved by the task. If this
+state is `Send`, i.e. it can be moved across threads, then the task itself can be moved
+across threads. Conversely, if the state is not `Send`, then neither is the task.
+
+For example, this works:
+
+```rust
+use tokio::task::yield_now;
+use std::rc::Rc;
+
+#[tokio::main]
+async fn main() {
+    tokio::spawn(async {
+        // The scope forces `rc` to drop before `.await`.
+        {
+            let rc = Rc::new("Hello");
+            println!("{}", rc);
+        }
+
+        // `rc` is no longer used, it is **not** persisted when
+        // the task yields to the scheduler.
+        yield_now().await;
+    });
+}
+```
+
+This does not work:
+
+```rust
+use tokio::task::yield_now;
+use std::rc::Rc;
+
+#[tokio::main]
+async fn main() {
+    tokio::spawn(async {
+        let rc = Rc::new("Hello");
+
+        // `rc` is used after `.await` so it must be
+        // persisted to the task's state.
+        yield_now().await;
+
+        println!("{}", rc);
+    });
+}
+```
+
+Attempting to copmile the snippet results in:
+
+```
+error: future cannot be sent between threads safely
+   --> src/main.rs:6:5
+    |
+6   |     tokio::spawn(async {
+    |     ^^^^^^^^^^^^ future created by async block is not `Send`
+    | 
+   ::: [..]spawn.rs:127:21
+    |
+127 |         T: Future + Send + 'static,
+    |                     ---- required by this bound in
+    |                          `tokio::task::spawn::spawn`
+    |
+    = help: within `impl std::future::Future`, the trait
+    |       `std::marker::Send` is not  implemented for
+    |       `std::rc::Rc<&str>`
+note: future is not `Send` as this value is used across an await
+   --> src/main.rs:10:9
+    |
+7   |         let rc = Rc::new("hello");
+    |             -- has type `std::rc::Rc<&str>` which is not `Send`
+...
+10  |         yield_now().await;
+    |         ^^^^^^^^^^^^^^^^^ await occurs here, with `rc` maybe
+    |                           used later
+11  |         println!("{}", rc);
+12  |     });
+    |     - `rc` is later dropped here
+```
+
+because `Rc` does not implement `Send`.
+
+
+### Shared state
+
+So far, we have a key-value server working. However, there is a major flaw:
+state is not shared across connections. Let us fix that!
+
+There are a couple of ways to share state in Tokio.
+1. Guard the shared state with a Mutex.
+2. Spawn a task to manage the state and use message passing to operate on it.
+
+Generally you want to use the first approach for simple data, and the second
+approach for things that require asynchronous work such as I/O primitives.
+The shared state we use is a `HashMap` and the operations are `insert` and
+`get`. Neither of these operations is asynchronous, so we will use a `Mutex`.
+
+Instead of using `Vec<u8>` we will use `Bytes` from the **bytes** crate. The
+goal of `Bytes` is to provide a robust byte array strucute for network
+programming. The biggest feature it adds over `Vec<u8>` is shallow cloning.
+In other words, calling `clone()` on a `Bytes` instance does not copy the
+underlying data. Instead, a `Bytes` instance is a refrence-counted handle
+to some underlying data. The `Bytes` type is thus roughly an `Arc<Vec<u8>>`
+but with some added capabilities.
+
+The `HashMap` will be shared across many tasks and potentially many threads.
+To support this, it is wrapped in `Arc<Mutex<_>>`.
+
+```rust
+use bytes::Bytes;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+type Db = Arc<Mutex<HashMap<String, Bytes>>>;
+```
+
+Note that `std::sync::Mutex` and **not** `tokio::sync::Mutex` is used to guard
+the `HashMap`. A common error is to unconditionally use `tokio::sync::Mutex` from
+within async code. An async mutex is a mutex that is locked across calls to `.await`.
+
+
+### Holding a `MutexGuard` across an `.await`
+
+You might write code that looks like this:
+
+```rust
+use std::sync::{Mutex, MutexGuard};
+
+async fn increment_and_do_stuff(mutex: &Mutex<i32>) {
+    let mut lock: MutexGuard<i32> = mutex.lock().unwrap();
+    *lock += 1;
+
+    do_something_async().await;
+} // lock goes out of scope here
+```
+
+When you try and spawn something that calls this function, you will encounter
+the following error message:
+
+```
+error: future cannot be sent between threads safely
+   --> src/lib.rs:13:5
+    |
+13  |     tokio::spawn(async move {
+    |     ^^^^^^^^^^^^ future created by async block is not `Send`
+    |
+   ::: /playground/.cargo/registry/src/github.com-1ecc6299db9ec823/tokio-0.2.21/src/task/spawn.rs:127:21
+    |
+127 |         T: Future + Send + 'static,
+    |                     ---- required by this bound in `tokio::task::spawn::spawn`
+    |
+    = help: within `impl std::future::Future`, the trait `std::marker::Send` is not implemented for `std::sync::MutexGuard<'_, i32>`
+note: future is not `Send` as this value is used across an await
+   --> src/lib.rs:7:5
+    |
+4   |     let mut lock: MutexGuard<i32> = mutex.lock().unwrap();
+    |         -------- has type `std::sync::MutexGuard<'_, i32>` which is not `Send`
+...
+7   |     do_something_async().await;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^ await occurs here, with `mut lock` maybe used later
+8   | }
+    | - `mut lock` is later dropped here
+```
+
+This happens because the `std::sync::MutexGuard` type is **not** `Send`. This means that
+you can't send a mutex lock to another thread, and the error happens because the Tokio
+runtime can move a task between threads at every `.await`. To avoid this, you should
+restructure your code such that the mutex lock's destructor runs before the `.await`.
+
+```rust
+async fn increment_and_do_stuff(mutex: &Mutex<i32>) {
+    {
+        let mut lock: MutexGuard<i32> = mutex.lock().unwrap();
+        *lock += 1;
+    } // lock goes out of scope here
+
+    do_something_async().await;
+}
+```
+
+Note that this does not work:
+
+```rust
+use std::sync::{Mutex, MutexGuard};
+
+// This fails too.
+async fn increment_and_do_stuff(mutex: &Mutex<i32>) {
+    let mut lock: MutexGuard<i32> = mutex.lock().unwrap();
+    *lock += 1;
+    drop(lock);
+
+    do_something_async().await;
+}
+```
+
+This is because the compiler currently calculates whether a future is `Send` based
+on scope information only. The compiler will hopefully be updated to support explicitly
+dropping it in the future, but for now, you must explicitly use a scope.
+
+The safest way to handle a mutex is to wrap it in a struct, and lock the mutex only
+inside non-async methods on that struct.
+
+```rust
+use std::sync::Mutex;
+
+struct CanIncrement {
+    mutex: Mutex<i32>,
+}
+
+impl CanIncrement {
+    fn increment(&self) {
+        let mut lock = self.mutex.lock().unwrap();
+        *lock += 1;
+    }
+}
+
+async fn increment_and_do_stuff(can_incr: &CanIncrement) {
+    can_incr.increment();
+    do_something_async().await;
+}
+```
+
+This pattern guarantees that you won't run into the `Send` error, because the mutex
+guard does not appear anywhere in an async function. It also protects you from deadlocks,
+when using crates whose `MutexGuard` implements `Send`.
