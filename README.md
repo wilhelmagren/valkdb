@@ -599,3 +599,47 @@ shard.insert(key, value);
 
 The simple implementation outlined above requires using a fixed number of shards,
 and the number of shards cannot be changed once the sharded map is created.
+
+
+### Channels
+
+Say we want to run two concurrent Redis commands. We can spawn one task per command.
+Then the two commands would happen concurrently.
+
+At first, we might try something like:
+
+```rust
+use mini_redis::client;
+
+#[tokio::main]
+async fn main() {
+    let mut client = client::connect("127.0.0.1:6379").await.unwrap();
+
+    let t1 = tokio::spawn(async {
+        let res = client.get("foo").await;
+    });
+
+    let t2 = tokio::spawn(async {
+        client.set("foo", "bar".into()).await;
+    });
+
+    t1.await.unwrap();
+    t2.await.unwrap();
+}
+```
+
+This does not compile because both tasks need to access the `client` somehow. As
+`Client` does not implement `Copy`, it will not compile without some code to facilitate
+sharing. Additionally, `Client::set` takes `&mut self`, which means that exclusive
+access is required to call it. We could open a connection per task, but that is not
+ideal. We cannot use `std::sync::Mutex` as `.await` would need to be called with
+the lock held. We could use `tokio::sync::Mutex`, but that would only allow a single
+in-flight request. If the client implements **pipelining** (sending many manual commands
+without waiting for each prior command's response), an async mutex results in
+underutilizing the connection.
+
+
+### Message passing
+
+The answer is to use message passing.
+
