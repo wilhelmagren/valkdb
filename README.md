@@ -532,3 +532,70 @@ async fn increment_and_do_stuff(can_incr: &CanIncrement) {
 This pattern guarantees that you won't run into the `Send` error, because the mutex
 guard does not appear anywhere in an async function. It also protects you from deadlocks,
 when using crates whose `MutexGuard` implements `Send`.
+
+The `tokio::sync::Mutex` type provided by Tokio can also be used. The primary feature of
+the Tokio mutex is that it can be held across an `.await` without any issues. That said,
+an asynchronous mutex is more expensive than an ordinary mutex, and it is typically better
+to use one of the two other approaches.
+
+```rust
+use tokio::sync::Mutex;  // note! this uses the Tokio mutex
+
+async fn increment_and_do_stuff(mutex: &Mutex<i32>) {
+    let mut lock = mutex.lock().unwrap();
+    *lock += 1;
+
+    do_something_async().await;
+} // lock goes out of scope here
+```
+
+
+### Tasks, threads, and contention
+
+Using a blocking mutex to guard short critical sections is an acceptable strategy
+when contention is minimal. When a lock is contended, the thread executing the task
+must block and wait on the mutex. This will not only block the current task but it
+will also block all other tasks scheduled on the current thread.
+
+By default, the Tokio runtime uses a multi-threaded scheduler. Tasks are scheduled on
+any number of threads managed by the runtime. If a large number of tasks are scheduled
+to execute and they all require access to the mutex, then there will be contention.
+On the other hand, if the `current_thread` runtime flavor is used, then the mutex will
+never be contended.
+
+If contention on a synchronization mutex becomes a problem, the best fix is rarely to
+switch to the Tokio mutex. Instead, options to consider are to:
+- Let a dedicated task manage the state and use message passing.
+- Shard the mutex.
+- Restructure the code to avoid the mutex.
+
+
+### Mutex sharding
+
+In our case, as each *key* is independent, mutex sharding will work well. To do this,
+instead of having a single `Mutex<HashMap<_, _>>` instance, we would introduce `N`
+distinct instances.
+
+```rust
+type ShardedDb = Arc<Vec<Mutex<HashMap<String, Vec<u8>>>>>;
+
+fn new_sharded_db(num_shards: usize) -> ShardedDb {
+    let mut db = Vec::with_capacity(num_shards);
+    for _ in 0..num_shards {
+        db.push(Mutex::new(HashMap::new()));
+    }
+    Arc::new(db)
+}
+```
+
+Then, finding the cell for any given key becomes a two step process. First, the key
+is used to identify which shard it is part of. Then, the key is looked up in the
+`HashMap`.
+
+```rust
+let shard = db[hash(key) % db.len()].lock().unwrap();
+shard.insert(key, value);
+```
+
+The simple implementation outlined above requires using a fixed number of shards,
+and the number of shards cannot be changed once the sharded map is created.
